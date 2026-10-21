@@ -283,6 +283,57 @@ fn keeps_the_original_file_mode() {
     assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
 }
 
+/// #6602: saving a hard-linked file updates every link, not just the path that was saved.
+#[cfg(unix)]
+#[test]
+fn keeps_hard_links() {
+    use std::os::unix::fs::MetadataExt;
+    let d = TempDir::new("hardlink");
+    let a = d.0.join("a.psd");
+    let b = d.0.join("b.psd");
+    std::fs::write(&a, ORIGINAL).unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+    atomic_write(&a, b"new").unwrap();
+    assert_eq!(std::fs::read(&b).unwrap(), b"new");
+    assert_eq!(std::fs::metadata(&a).unwrap().nlink(), 2);
+    assert_no_temp(&d.0);
+}
+
+/// A hard-linked file whose in-place write fails still gets the new bytes, by the usual rename.
+#[test]
+fn failed_in_place_write_falls_back_to_the_rename() {
+    struct NoInPlace;
+    impl AtomicFs for NoInPlace {
+        fn is_hard_linked(&self, _path: &Path) -> bool {
+            true
+        }
+        fn write_in_place(&self, _path: &Path, _bytes: &[u8]) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::StorageFull, "injected: no space left on device"))
+        }
+        fn write_new(&self, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
+            RealFs.write_new(tmp, bytes)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            RealFs.rename(from, to)
+        }
+        fn remove(&self, path: &Path) -> io::Result<()> {
+            RealFs.remove(path)
+        }
+        fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+            RealFs.sync_dir(dir)
+        }
+        fn copy_metadata(&self, from: &Path, to: &Path) -> io::Result<()> {
+            RealFs.copy_metadata(from, to)
+        }
+    }
+    let d = TempDir::new("inplace-fail");
+    let p = d.0.join("doc.psd");
+    std::fs::write(&p, ORIGINAL).unwrap();
+    atomic_write_with(&NoInPlace, NO_RETRY, &p, b"new").unwrap();
+    assert_eq!(std::fs::read(&p).unwrap(), b"new");
+    assert_no_temp(&d.0);
+}
+
 #[cfg(unix)]
 #[test]
 fn writes_through_a_symlink() {
