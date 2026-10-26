@@ -22,10 +22,14 @@ impl Drop for TempDir {
     }
 }
 
-/// Only the target remains: no temporary file was left behind.
+/// Only the target remains: no temporary file or in-place backup was left behind.
 fn assert_no_temp(dir: &Path) {
-    let leftovers: Vec<_> =
-        std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".tmp")).collect();
+    let leftovers: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp") || n.ends_with(".bak"))
+        .collect();
     assert!(leftovers.is_empty(), "temporary files left behind: {leftovers:?}");
 }
 
@@ -369,11 +373,8 @@ fn locked_hard_linked_file_falls_back_to_the_rename() {
 fn in_place_save_reports_a_temporary_file_it_could_not_remove() {
     struct StuckTemp;
     impl AtomicFs for StuckTemp {
-        fn is_hard_linked(&self, path: &Path) -> bool {
-            RealFs.is_hard_linked(path)
-        }
-        fn write_in_place(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-            RealFs.write_in_place(path, bytes)
+        fn write_in_place(&self, path: &Path, bytes: &[u8], backup: &Path) -> io::Result<InPlace> {
+            RealFs.write_in_place(path, bytes, backup)
         }
         fn write_new(&self, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
             RealFs.write_new(tmp, bytes)
@@ -401,15 +402,19 @@ fn in_place_save_reports_a_temporary_file_it_could_not_remove() {
     assert_eq!(std::fs::read(&b).unwrap(), b"new");
 }
 
-/// A hard-linked file whose in-place write fails still gets the new bytes, by the usual rename.
+/// An in-place write that fails partway (a nearly full disk) is an error that names both
+/// versions, never a rename that cuts the saved path off from the half-written links.
+#[cfg(unix)]
 #[test]
-fn failed_in_place_write_falls_back_to_the_rename() {
-    struct NoInPlace;
-    impl AtomicFs for NoInPlace {
-        fn is_hard_linked(&self, _path: &Path) -> bool {
-            true
-        }
-        fn write_in_place(&self, _path: &Path, _bytes: &[u8]) -> io::Result<()> {
+fn in_place_write_failing_partway_is_reported_not_renamed() {
+    use std::os::unix::fs::MetadataExt;
+    /// Clones the old bytes, writes half the new ones over the file, then runs out of space.
+    struct HalfWrite;
+    impl AtomicFs for HalfWrite {
+        fn write_in_place(&self, path: &Path, bytes: &[u8], backup: &Path) -> io::Result<InPlace> {
+            std::fs::copy(path, backup)?;
+            let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+            f.write_all(&bytes[..bytes.len() / 2])?;
             Err(io::Error::new(io::ErrorKind::StorageFull, "injected: no space left on device"))
         }
         fn write_new(&self, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -428,11 +433,53 @@ fn failed_in_place_write_falls_back_to_the_rename() {
             RealFs.copy_metadata(from, to)
         }
     }
-    let d = TempDir::new("inplace-fail");
+    let d = TempDir::new("inplace-half");
+    let a = d.0.join("a.psd");
+    let b = d.0.join("b.psd");
+    std::fs::write(&a, ORIGINAL).unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+    let new = b"the new version of the document";
+    let e = atomic_write_with(&HalfWrite, NO_RETRY, &a, new).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::StorageFull);
+    let msg = e.to_string();
+    assert!(msg.contains("other hard links may now be partly overwritten"), "{msg}");
+    // The links were not split, so the error is about every one of them.
+    assert_eq!(std::fs::metadata(&b).unwrap().nlink(), 2);
+    assert_eq!(&std::fs::read(&b).unwrap()[..new.len() / 2], &new[..new.len() / 2]);
+    // Both versions are where the error says.
+    let left = |ext: &str| std::fs::read_dir(&d.0).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == ext)).unwrap();
+    let (tmp, backup) = (left("tmp"), left("bak"));
+    assert!(msg.contains(&tmp.display().to_string()) && msg.contains(&backup.display().to_string()), "{msg}");
+    assert_eq!(std::fs::read(&tmp).unwrap(), new);
+    assert_eq!(std::fs::read(&backup).unwrap(), ORIGINAL);
+}
+
+/// The link count comes from the file that is written: a file with one link is renamed over as
+/// before, and an in-place save leaves no backup behind.
+#[cfg(unix)]
+#[test]
+fn in_place_writes_only_hard_linked_files_and_cleans_up_its_backup() {
+    let d = TempDir::new("inplace-single");
     let p = d.0.join("doc.psd");
     std::fs::write(&p, ORIGINAL).unwrap();
-    atomic_write_with(&NoInPlace, NO_RETRY, &p, b"new").unwrap();
-    assert_eq!(std::fs::read(&p).unwrap(), b"new");
+    let backup = d.0.join("doc.bak");
+    assert_eq!(RealFs.write_in_place(&p, b"new", &backup).unwrap(), InPlace::Skipped);
+    assert_eq!(std::fs::read(&p).unwrap(), ORIGINAL, "nothing was touched");
+    assert!(!backup.exists());
+
+    let q = d.0.join("link.psd");
+    std::fs::hard_link(&p, &q).unwrap();
+    assert_eq!(RealFs.write_in_place(&p, b"new", &backup).unwrap(), InPlace::Written);
+    assert_eq!(std::fs::read(&q).unwrap(), b"new");
+    // A file system that clones keeps the old bytes; one that can't makes no backup at all.
+    // macOS's temporary folder is on APFS, which always clones.
+    assert!(!cfg!(target_vendor = "apple") || backup.exists(), "APFS clones the old bytes aside");
+    if backup.exists() {
+        assert_eq!(std::fs::read(&backup).unwrap(), ORIGINAL);
+    }
+    std::fs::remove_file(&backup).ok();
+    atomic_write(&p, b"newer").unwrap();
+    assert_eq!(std::fs::read(&q).unwrap(), b"newer");
     assert_no_temp(&d.0);
 }
 
